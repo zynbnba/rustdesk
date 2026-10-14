@@ -1,0 +1,588 @@
+name: RustDesk Build (Windows / Android)
+
+# ============================================================================
+# 用 GitHub 托管 runner 编译 RustDesk，产物内置自建服务器：
+#   RENDEZVOUS_SERVER / RELAY_SERVER / RS_PUB_KEY / API_SERVER / APP_NAME
+#
+# 产物：
+#   - Windows 安装包: rustdesk-<ver>-x86_64.exe（自解压安装程序，可直接分发安装）
+#   - Windows 便携版: rustdesk-windows-x64.zip（解压即用）
+#   - Android: app-*-release.apk（未移植源码补丁，构建会判红，默认不跑）
+#
+# 触发：**只用 Actions 页面的 Run workflow**（手动）。
+#       刻意不挂 push —— 这个 workflow 一跑就是几十分钟，不该被随手一次
+#       提交触发；而且需要 Private 仓库（内置服务器信息在 env 里）。
+#
+# ⚠️ 关键：**光导入 RENDEZVOUS_SERVER 这类环境变量是没用的**。
+#    新版 RustDesk 已移除编译期 env 注入（hbb_common/build.rs 只做 protobuf
+#    codegen，全仓搜不到 option_env!），地址现在是 config.rs 里的运行时默认值。
+#    所以 build-windows 里有一个「Patch RustDesk source」步骤直接改源码，
+#    改完立即硬校验。这正是 .cnb.yml 里 stage-4 的同一套逻辑（同一组正则）。
+#
+# 本文件放在哪里都行：第一步自己 git clone 上游 rustdesk，不要求先 fork。
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_windows:
+        description: '构建 Windows（rustdesk.exe）'
+        type: boolean
+        default: true
+      build_android:
+        description: '构建 Android（APK；源码补丁与双 ABI 独立 install-root 均未移植，会判红）'
+        type: boolean
+        default: false
+
+env:
+  # ---- 自建服务器参数 ------------------------------------------------
+  # 注意：这些变量**不是**注入通道，只是「要写进 config.rs 的值」和
+  # 校验用的期望值。真正的注入靠 build-windows 的 Patch RustDesk source。
+  RENDEZVOUS_SERVER: "ccdlsx.i234.me"
+  RELAY_SERVER: "ccdlsx.i234.me"
+  API_SERVER: "http://ccdlsx.i234.me:21114"
+  RS_PUB_KEY: "6VM0foq6XQjEX689Ta2oIs6SesXQbtq4QSiDEvr1cn0="
+  APP_NAME: "RustDesk-CCD"
+
+  # ---- 工具链版本（对齐 RustDesk 官方 CI）----
+  RUSTDESK_REPO: "https://github.com/rustdesk/rustdesk.git"
+  # 钉最新稳定 tag：产物版本号才有意义（master 上是 1.5.1 开发版，且随时会变）。
+  # 已核实 1.5.0 与 master 的 hbb_common 子模块是同一个 commit（229b9045），
+  # 四处补丁正则、vcpkg baseline（9e593bb1）、flutter 补丁文件全部一致。
+  RUSTDESK_REF: "1.5.0"
+  FLUTTER_VERSION: "3.24.5"
+  # 与 .cnb.yml 一致钉 1.75：stable 过新时 RustDesk 的某些依赖会编不过。
+  # 万一某天 1.75 编不过（依赖要求更新的 rustc），把这里改成 1.81 再试。
+  RUST_VERSION: "1.75"
+  CARGO_NDK_VERSION: "3.1.2"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  NDK_VERSION: "r26c"
+  # vcpkg 版本**不在这里指定**：必须 checkout RustDesk vcpkg.json 里的
+  # baseline，否则报 no version database entry for X at Y。
+  # 注意键位：master 的 vcpkg.json 用的是
+  # vcpkg-configuration.default-registry.baseline（当前值见下），
+  # 顶层 builtin-baseline 是旧写法。只读旧键会拿到 $null。
+
+jobs:
+  # ==========================================================================
+  # 1) 生成 flutter_rust_bridge 桥接代码（Android / Windows 都需要）
+  # ==========================================================================
+  generate-bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout RustDesk
+        run: |
+          git clone --recurse-submodules -b $RUSTDESK_REF $RUSTDESK_REPO rd
+          cd rd && git submodule update --init --recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl git g++ libclang-dev \
+            libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          # 必须与 Windows job 用同一个版本：桥接代码是两边共用的产物，
+          # 生成时和编译时的 Flutter 版本不一致会埋下难查的 ABI / API 差异。
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install bridge deps
+        run: |
+          cargo install cargo-expand --version $CARGO_EXPAND_VERSION --locked
+          cargo install flutter_rust_bridge_codegen --version $FLUTTER_RUST_BRIDGE_VERSION --features uuid --locked
+          cd rd
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          cd flutter && flutter pub get
+
+      - name: Generate bridge
+        run: |
+          cd rd
+          flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          path: |
+            rd/src/bridge_generated.rs
+            rd/src/bridge_generated.io.rs
+            rd/flutter/lib/generated_bridge.dart
+            rd/flutter/lib/generated_bridge.freezed.dart
+            rd/flutter/macos/Runner/bridge_generated.h
+            rd/flutter/ios/Runner/bridge_generated.h
+
+  # ==========================================================================
+  # 2) Android APK
+  # ==========================================================================
+  build-android:
+    needs: [ generate-bridge ]
+    # 默认不跑：这里的 Android 分支还是「env 注入」的旧写法（对当前 RustDesk
+    # 无效），且两个 ABI 共用同一个 vcpkg install-root（会互删 ffmpeg）。
+    # 修法与 .cnb.yml 的 android 分支一致：源码补丁 + 独立 --x-install-root。
+    # 需要时在 Run workflow 里勾 build_android。
+    if: ${{ inputs.build_android }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl git g++ libclang-dev \
+            llvm-dev nasm ninja-build openjdk-17-jdk-headless pkg-config wget
+
+      - name: Checkout RustDesk
+        run: |
+          git clone --recurse-submodules -b $RUSTDESK_REF $RUSTDESK_REPO rd
+          cd rd && git submodule update --init --recursive
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          git apply ${{ github.workspace }}/rd/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: Install vcpkg deps (Android)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cd rd
+          ./flutter/build_android_deps.sh arm64-v8a
+          ./flutter/build_android_deps.sh armeabi-v7a
+
+      - name: Restore bridge
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Build librustdesk.so (注入自建服务器)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cd rd
+          cargo install cargo-ndk --version $CARGO_NDK_VERSION --locked
+          ./flutter/ndk_arm64.sh
+          ./flutter/ndk_arm.sh
+          for T in aarch64-linux-android armv7-linux-androideabi; do
+            SO="target/$T/release/liblibrustdesk.so"
+            echo "[check] $SO"
+            strings "$SO" | grep -q "$RENDEZVOUS_SERVER" \
+              && echo "[OK] $T 内置 $RENDEZVOUS_SERVER" \
+              || { echo "::error::$T 未内置服务器地址"; exit 1; }
+          done
+
+      - name: Assemble jniLibs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cd rd
+          SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
+          mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p flutter/android/app/src/main/jniLibs/armeabi-v7a
+          cp target/aarch64-linux-android/release/liblibrustdesk.so flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          cp target/armv7-linux-androideabi/release/liblibrustdesk.so flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+          cp "$SYSROOT/aarch64-linux-android/libc++_shared.so" flutter/android/app/src/main/jniLibs/arm64-v8a/
+          cp "$SYSROOT/arm-linux-androideabi/libc++_shared.so" flutter/android/app/src/main/jniLibs/armeabi-v7a/
+
+      - name: Build APK
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          export PATH=$JAVA_HOME/bin:$PATH
+          cd rd
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx4g/g" flutter/android/gradle.properties || true
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" flutter/android/app/build.gradle || true
+          cd flutter
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          flutter build apk --release --target-platform android-arm --split-per-abi
+          ls -la build/app/outputs/flutter-apk/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-android-apk
+          path: |
+            rd/flutter/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            rd/flutter/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+
+  # ==========================================================================
+  # 3) Windows 桌面版（x64）—— windows-2022 托管 runner
+  #
+  # 顺序照抄 .cnb.yml 的 6 个 stage（那套是在真机上跑通的）：
+  #   拉源码 → Flutter/Rust → 自定义 engine → vcpkg → 源码补丁 → 编译 → 三地址校验
+  # 每一步的失败点都提前拦，不留「看着成功、其实连了官方服务器」的产物。
+  # ==========================================================================
+  build-windows:
+    needs: [ generate-bridge ]
+    if: ${{ inputs.build_windows }}
+    runs-on: windows-2022
+    env:
+      # hwcodec/build.rs 与 build.py 都靠这个变量找 ffmpeg / libvpx
+      VCPKG_ROOT: C:\vcpkg
+    steps:
+      - name: Checkout RustDesk
+        shell: pwsh
+        run: |
+          git clone --recurse-submodules -b ${{ env.RUSTDESK_REF }} ${{ env.RUSTDESK_REPO }} rd
+          cd rd
+          git submodule update --init --recursive
+          git rev-parse HEAD
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          # 显式钉版本：托管 runner 预装的那版不一定是 3.24.5，
+          # 而自定义 engine 的落地目录是按版本号拼出来的。
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Rust (${{ env.RUST_VERSION }}, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore bridge
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Replace engine with RustDesk custom flutter engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          # 目录从 fluter 自己的位置推导，不写死 /hostedtoolcache 路径
+          $flutterRoot = Split-Path (Split-Path (Get-Command flutter).Source)
+          $dest = Join-Path $flutterRoot 'bin\cache\artifacts\engine\windows-x64-release'
+          Write-Host "[engine] Flutter root = $flutterRoot"
+          Write-Host "[engine] 覆盖目标   = $dest"
+          if (-not (Test-Path (Join-Path $flutterRoot 'bin\cache'))) {
+            throw "Flutter cache 不存在，flutter precache 没跑成功：$flutterRoot"
+          }
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release -Force
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item -Force windows-x64-release/* $dest -Recurse
+          # 自检：目标目录必须真的有东西 —— 路径拼错时它是空的，而空目录
+          # 一样能让 Copy-Item 成功返回，等编译时才炸就晚了。
+          $copied = (Get-ChildItem $dest -Force | Measure-Object).Count
+          if ($copied -eq 0) { throw "自定义 engine 未落地：$dest 为空" }
+          Write-Host "[engine] 覆盖后 $dest 内有 $copied 项"
+
+      - name: Patch flutter (dropdown menu enableFilter)
+        shell: bash
+        run: |
+          FLUTTER_ROOT=$(dirname $(dirname $(which flutter)))
+          PATCH=rd/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          if [ ! -f "$PATCH" ]; then
+            echo "::warning::$PATCH 不存在（上游可能已移除该补丁），跳过"
+            exit 0
+          fi
+          cp "$PATCH" "$FLUTTER_ROOT/"
+          cd "$FLUTTER_ROOT"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      # ---- vcpkg：必须用 RustDesk 自己的 builtin-baseline --------------------
+      # 用别的 commit 会直接报 no version database entry for X at Y（.cnb.yml 踩过）。
+      - name: Setup vcpkg (checkout RustDesk builtin-baseline)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\vcpkg\.git')) {
+            git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          }
+          # baseline 键位：master 的 vcpkg.json 用
+          # vcpkg-configuration.default-registry.baseline，
+          # 顶层 builtin-baseline 是旧写法。只读旧键会拿到 $null 直接 throw。
+          $vcpkgJson = Get-Content rd\vcpkg.json -Raw | ConvertFrom-Json
+          $baseline = $vcpkgJson.'vcpkg-configuration'.'default-registry'.baseline
+          if (-not $baseline) { $baseline = $vcpkgJson.'builtin-baseline' }
+          Write-Host "[vcpkg] RustDesk baseline = $baseline"
+          if (-not $baseline) { throw "rd\vcpkg.json 里找不到 baseline（default-registry.baseline / builtin-baseline）" }
+          git -C C:\vcpkg fetch --all --tags --quiet
+          git -C C:\vcpkg checkout $baseline --quiet
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "[vcpkg] baseline 不可用，回退 master"
+            git -C C:\vcpkg checkout master --quiet
+          }
+          & C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg.bat 失败" }
+
+      - name: Install vcpkg dependencies (x64-windows-static)
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+          # 宿主（构建期的工具）用动态三元组，目标库才用静态 —— 两者混用会编不出来
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows
+        run: |
+          # manifest 根必须在 rustdesk 目录：vcpkg-configuration.json 的 overlay
+          # 是相对路径，在别处跑会解析不到，等于「一个依赖都没装」。
+          Set-Location rd
+          & C:\vcpkg\vcpkg.exe install --triplet x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install 失败（x64-windows-static）" }
+          $inc = 'C:\vcpkg\installed\x64-windows-static\include'
+          if (-not (Test-Path "$inc\libavcodec\avcodec.h")) {
+            throw "vcpkg 未产出 libavcodec/avcodec.h，ffmpeg 依赖不完整：$inc"
+          }
+          Write-Host "[vcpkg] ffmpeg 头已就位：$inc"
+          Set-Location $env:GITHUB_WORKSPACE
+
+      # ---- 源码补丁（与 .cnb.yml stage-4 同一组正则）-----------------------
+      # 光设 env 无效：新版 RustDesk 的 build.rs 不再读 RENDEZVOUS_SERVER 等变量。
+      - name: Patch RustDesk source (注入自建服务器)
+        shell: pwsh
+        env:
+          RS_RENDEZVOUS: ${{ env.RENDEZVOUS_SERVER }}
+          RS_KEY: ${{ env.RS_PUB_KEY }}
+          RS_APPNAME: ${{ env.APP_NAME }}
+        run: |
+          Set-Location rd
+          $rv      = $env:RS_RENDEZVOUS
+          $key     = $env:RS_KEY
+          $appname = $env:RS_APPNAME
+          if (-not $rv -or -not $key -or -not $appname) {
+            throw "RS_RENDEZVOUS / RS_KEY / RS_APPNAME 为空：本文件顶部的 env 段没传进来"
+          }
+
+          # 地址现在是运行时默认值（不是编译期常量）：
+          #   RENDEZVOUS_SERVERS / RS_PUB_KEY（const）
+          #   PROD_RENDEZVOUS_SERVER / APP_NAME（RwLock<String>）
+          $targets = @("libs\hbb_common\src\config.rs", "libs\base\src\config.rs")
+          $patched = @()
+          foreach ($t in $targets) {
+            if (-not (Test-Path $t)) { continue }
+            $src = Get-Content $t -Raw -Encoding UTF8
+            $orig = $src
+
+            $src = [regex]::Replace($src,
+              '(pub\s+const\s+RENDEZVOUS_SERVERS\s*:\s*&\[&str\]\s*=\s*)&\[[^\]]*\]',
+              { param($m) $m.Groups[1].Value + '&["' + $env:RS_RENDEZVOUS + '"]' })
+            $src = [regex]::Replace($src,
+              '(pub\s+const\s+RS_PUB_KEY\s*:\s*&str\s*=\s*)"[^"]*"',
+              { param($m) $m.Groups[1].Value + '"' + $env:RS_KEY + '"' })
+            $src = [regex]::Replace($src,
+              '(static\s+ref\s+PROD_RENDEZVOUS_SERVER\s*:\s*RwLock<String>\s*=\s*RwLock::new\()"[^"]*"',
+              { param($m) $m.Groups[1].Value + '"' + $env:RS_RENDEZVOUS + '"' })
+            $src = [regex]::Replace($src,
+              '(static\s+ref\s+APP_NAME\s*:\s*RwLock<String>\s*=\s*RwLock::new\()"[^"]*"',
+              { param($m) $m.Groups[1].Value + '"' + $env:RS_APPNAME + '"' })
+
+            if ($src -ne $orig) {
+              # 保留 UTF-8 无 BOM、不换行风格：Rust 源码是 LF
+              [System.IO.File]::WriteAllText((Resolve-Path $t), $src, (New-Object System.Text.UTF8Encoding $false))
+              $patched += $t
+            }
+          }
+          Write-Host "[patch] 已修改文件: $(if ($patched) { $patched -join ', ' } else { '(无 —— 目标文件未找到!)' })"
+
+          # 硬校验：补丁必须落盘，否则后面全白做
+          $cfg = "libs\hbb_common\src\config.rs"
+          if (-not (Select-String -Path $cfg -Pattern $rv -SimpleMatch -Quiet)) {
+            throw "源码补丁未生效：$cfg 里没有 $rv"
+          }
+          if (-not (Select-String -Path $cfg -Pattern $key -SimpleMatch -Quiet)) {
+            throw "源码补丁未生效：$cfg 里没有公钥"
+          }
+          Write-Host "[patch] 自建服务器已注入源码：$rv / $appname"
+          Set-Location $env:GITHUB_WORKSPACE
+
+      - name: Build rustdesk.exe
+        shell: pwsh
+        run: |
+          Set-Location rd
+          Write-Host "[build] VCPKG_ROOT = $env:VCPKG_ROOT"
+          $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows-static'
+
+          # 双保险：源码已改，但 hbb_common 可能因增量缓存不重编
+          # （Android 那次 .so 编成功却没有地址，就是这个坑）。
+          $prev = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          & cargo clean -p hbb_common --release
+          $ErrorActionPreference = $prev
+          if (Test-Path "libs\hbb_common\build.rs") { (Get-Item "libs\hbb_common\build.rs").LastWriteTime = Get-Date }
+
+          rustup target add x86_64-pc-windows-msvc
+          python .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if ($LASTEXITCODE -ne 0) { throw "build.py 失败，退出码 $LASTEXITCODE" }
+
+          $out = Join-Path $env:GITHUB_WORKSPACE 'rustdesk-out'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -Recurse -Force .\flutter\build\windows\x64\runner\Release\* $out\
+          Set-Location $env:GITHUB_WORKSPACE
+          Get-ChildItem rustdesk-out | Select-Object Name, Length
+
+      # ---- 安装包：自解压 exe（上游 release 页上的 rustdesk-<ver>-x86_64.exe）----
+      # 机制（已核对 1.5.0 源码）：
+      #   libs/portable/generate.py 把 -f 目录 brotli 压缩后写进 data.bin，再在
+      #   libs/portable 里执行 cargo build --release，产出
+      #   target/release/rustdesk-portable-packer.exe —— 它就是安装程序本体
+      #   （libs/portable/Cargo.toml 里包名就叫 rustdesk-portable-packer）。
+      # 注意：payload 是 brotli 压缩的，所以**不能**拿脚本去 grep 安装包里的明文
+      #   地址来校验；要校验就校验打包前那个 rustdesk.exe（下面 Verify 步骤做的）。
+      - name: Build Windows installer (self-extracted exe)
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path rd\Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+                  Select-Object -First 1).Matches[0].Groups[1].Value
+          if (-not $ver) { throw "读不出 rd\Cargo.toml 的 version" }
+          Write-Host "[installer] RustDesk 版本 = $ver"
+          "RD_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Set-Location rd
+          # 打包目录名必须是 rustdesk：generate.py 的 -f/-e 都以它为基准
+          New-Item -ItemType Directory -Force -Path rustdesk | Out-Null
+          Copy-Item -Recurse -Force .\flutter\build\windows\x64\runner\Release\* .\rustdesk\
+          if (-not (Test-Path 'rustdesk\rustdesk.exe')) { throw "打包目录里没有 rustdesk.exe" }
+
+          # 上游同款处理：res/manifest.xml 里的 dpiAware 会让打包器嵌入资源时冲突
+          (Get-Content res\manifest.xml) | Where-Object { $_ -notmatch 'dpiAware' } |
+            Set-Content res\manifest.xml -Encoding utf8
+
+          python -m pip install --disable-pip-version-check -r libs\portable\requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install libs/portable/requirements.txt 失败" }
+
+          Push-Location libs\portable
+          # 内部会自己跑 cargo build --locked --release（workspace 共享根 target/）
+          python generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          $rc = $LASTEXITCODE
+          Pop-Location
+          if ($rc -ne 0) { throw "generate.py 失败，退出码 $rc" }
+
+          $packer = '.\target\release\rustdesk-portable-packer.exe'
+          if (-not (Test-Path $packer)) { throw "未产出打包器：$packer（rd\target\release 下找不到）" }
+          $name = "rustdesk-$ver-x86_64.exe"
+          Copy-Item -Force $packer "..\$name"
+          Set-Location $env:GITHUB_WORKSPACE
+          Get-Item $name | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Verify server baked in
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'rustdesk-out\rustdesk.exe'
+          if (-not (Test-Path $exe)) { throw "rustdesk.exe 未生成：$exe" }
+
+          # 校验**真的会被注入源码**的三项，一项不漏、也不查查不到的东西。
+          # 为什么原先的 API_SERVER 字面量校验必然判红（已核对 1.5.0 源码）：
+          #   src/common.rs:1223  pub fn get_api_server(api, custom)
+          #   优先用服务端登录响应里的 lic.api / api，其次才是用户设置的自定义值；
+          #   全仓没有任何 "http://..." 形式的 API 常量可注入，硬查字面量 = 必红。
+          # RELAY_SERVER 与 RENDEZVOUS_SERVER 同值（都是 ccdlsx.i234.me），
+          # 由 RENDEZVOUS_SERVERS 常量承载，所以合并成一项校验。
+          $targets = [ordered]@{
+            'RENDEZVOUS/RELAY' = '${{ env.RENDEZVOUS_SERVER }}'
+            'RS_PUB_KEY'       = '${{ env.RS_PUB_KEY }}'
+            'APP_NAME'         = '${{ env.APP_NAME }}'
+          }
+          $missing = @()
+          foreach ($k in $targets.Keys) {
+            $v = $targets[$k]
+            # Select-String 流式扫描，避免 ReadAllBytes 把整个 exe 读进内存
+            if (Select-String -Path $exe -Pattern $v -SimpleMatch -Encoding Default -Quiet) {
+              Write-Host "  [ OK ] $k = $v"
+            } else {
+              Write-Host "  [FAIL] $k = $v 未出现在 exe 中" -ForegroundColor Red
+              $missing += "$k($v)"
+            }
+          }
+          if ($missing.Count -gt 0) {
+            throw "rustdesk.exe 未内置以下内容，源码补丁未生效: $($missing -join ', ')"
+          }
+          Write-Host "[OK] rustdesk.exe 已内置会合/中继地址、公钥、AppName"
+          Write-Host "[note] API_SERVER 不在 exe 里属正常：客户端从服务端登录响应取该值"
+          Write-Host "       （或用户在 设置-网络-API服务器 里手填 ${{ env.API_SERVER }}）"
+
+      - name: Zip Windows portable build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path rustdesk-out\* -DestinationPath rustdesk-windows-x64.zip -Force
+          Get-Item rustdesk-windows-x64.zip, "rustdesk-$env:RD_VERSION-x86_64.exe" |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Upload Windows installer + portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-x64
+          path: |
+            rustdesk-*-x86_64.exe
+            rustdesk-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ==========================================================================
+  # 发布：把安装包挂到 Release。artifact 需要登录才能下载，Release 才能直接
+  # 发给别人装 —— 这一步失败不影响上面的构建结果，安装包仍在 artifact 里。
+  # ==========================================================================
+  publish-windows:
+    needs: [build-windows]
+    if: ${{ needs.build-windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rustdesk-windows-x64
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          ls -lh dist
+          tag="windows-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "RustDesk-CCD Windows 安装包 $tag" \
+            --notes "RustDesk-CCD Windows x64。内置会合/中继 ccdlsx.i234.me，AppName=RustDesk-CCD，公钥已注入。未做代码签名：首次运行会有 SmartScreen「未知发布者」提示。" \
+            --latest
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$tag"
