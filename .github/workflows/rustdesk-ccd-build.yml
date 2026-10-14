@@ -553,7 +553,7 @@ jobs:
           #   src/common.rs:1223  pub fn get_api_server(api, custom)
           #   优先用服务端登录响应里的 lic.api / api，其次才是用户设置的自定义值；
           #   全仓没有任何 "http://..." 形式的 API 常量可注入，硬查字面量 = 必红。
-          # RELAY_SERVER 与 RENDEZVOUS_SERVER 同值（都是 ccdlsx.i234.me），
+          # RELAY_SERVER 与 RENDEZVOUS_SERVER 同值（具体值见 Repository Variables），
           # 由 RENDEZVOUS_SERVERS 常量承载，所以合并成一项校验。
           $targets = [ordered]@{
             'RENDEZVOUS/RELAY' = '${{ env.RENDEZVOUS_SERVER }}'
