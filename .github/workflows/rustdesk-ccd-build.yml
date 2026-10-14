@@ -297,7 +297,13 @@ jobs:
           if ($bad.Count -gt 0) {
             throw "以下 Repository Variables 未设置或为空：$($bad -join ', ')"
           }
-          Write-Host "[OK] 五个自建服务器参数均已从 Variables 读到（值不打印，避免进公开日志）"
+
+          # Variables 不像 Secrets 那样由平台自动打码，而本仓库是 public、job 日志人人可见。
+          # 这里显式打码，免得后面的「校验」步骤把地址/公钥原样打进公开日志。
+          # add-mask 对本 job 内的后续步骤持续有效。
+          foreach ($v in $need.Values) { if ($v) { Write-Host "::add-mask::$v" } }
+
+          Write-Host "[OK] 五个自建服务器参数均已从 Variables 读到（值已打码，不进日志）"
 
       - name: Checkout RustDesk
         shell: pwsh
