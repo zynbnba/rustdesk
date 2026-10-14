@@ -3,6 +3,9 @@ name: RustDesk Build (Windows / Android)
 # ============================================================================
 # 用 GitHub 托管 runner 编译 RustDesk，产物内置自建服务器：
 #   RENDEZVOUS_SERVER / RELAY_SERVER / RS_PUB_KEY / API_SERVER / APP_NAME
+#   —— 这五个值**不再写在本文件里**，改从 Repository Variables 读取
+#      （Settings → Secrets and variables → Actions → Variables）。
+#      原因：本仓库是 public，明文写在文件里等于公开，GitHub 代码搜索能直接搜到。
 #
 # 产物：
 #   - Windows 安装包: rustdesk-<ver>-x86_64.exe（自解压安装程序，可直接分发安装）
@@ -11,7 +14,7 @@ name: RustDesk Build (Windows / Android)
 #
 # 触发：**只用 Actions 页面的 Run workflow**（手动）。
 #       刻意不挂 push —— 这个 workflow 一跑就是几十分钟，不该被随手一次
-#       提交触发；而且需要 Private 仓库（内置服务器信息在 env 里）。
+#       提交触发。
 #
 # ⚠️ 关键：**光导入 RENDEZVOUS_SERVER 这类环境变量是没用的**。
 #    新版 RustDesk 已移除编译期 env 注入（hbb_common/build.rs 只做 protobuf
@@ -35,14 +38,16 @@ on:
         default: false
 
 env:
-  # ---- 自建服务器参数 ------------------------------------------------
-  # 注意：这些变量**不是**注入通道，只是「要写进 config.rs 的值」和
+  # ---- 自建服务器参数：已移到 Repository Variables -----------------------
+  # 这五个值不在顶层定义，而是由用到它们的 job 在 job 级 env 里用 ${{ vars.XXX }}
+  # 读入（build-windows 用全部五个；build-android 只用 RENDEZVOUS_SERVER）。
+  #
+  # 为什么放 job 级而不是顶层：官方 Context availability 表里 jobs.<job_id>.env
+  # 明确支持 vars 上下文；顶层 env 对 vars 的支持我没能取到文档确认，而账号
+  # Actions 正被禁用、没法试跑，所以不冒「解析期就报 Unrecognized named-value」的风险。
+  #
+  # 注意：这些值**不是**注入通道，只是「要写进 config.rs 的值」和
   # 校验用的期望值。真正的注入靠 build-windows 的 Patch RustDesk source。
-  RENDEZVOUS_SERVER: "ccdlsx.i234.me"
-  RELAY_SERVER: "ccdlsx.i234.me"
-  API_SERVER: "http://ccdlsx.i234.me:21114"
-  RS_PUB_KEY: "6VM0foq6XQjEX689Ta2oIs6SesXQbtq4QSiDEvr1cn0="
-  APP_NAME: "RustDesk-CCD"
 
   # ---- 工具链版本（对齐 RustDesk 官方 CI）----
   RUSTDESK_REPO: "https://github.com/rustdesk/rustdesk.git"
@@ -60,9 +65,15 @@ env:
   NDK_VERSION: "r26c"
   # vcpkg 版本**不在这里指定**：必须 checkout RustDesk vcpkg.json 里的
   # baseline，否则报 no version database entry for X at Y。
-  # 注意键位：master 的 vcpkg.json 用的是
-  # vcpkg-configuration.default-registry.baseline（当前值见下），
-  # 顶层 builtin-baseline 是旧写法。只读旧键会拿到 $null。
+  # 注意键位：1.5.0 的 vcpkg.json 用的是
+  # vcpkg-configuration.default-registry.baseline，顶层 builtin-baseline 是旧写法
+  # （已实测：1.5.0 里 builtin-baseline 键**根本不存在**，只读旧键会拿到 $null）。
+  #
+  # VCPKG_COMMIT_ID 供 build-android 的 run-vcpkg 用：它的 vcpkgGitCommitId 需要
+  # 一个**完整 40 位 SHA**，就是上面这个 baseline（同物异名）。
+  # 此前该变量全文没有定义，action 会拿到空值 —— build-android 默认不跑，所以一直没暴露。
+  # 钉的是 1.5.0 的 baseline；RUSTDESK_REF 换 tag 时这里要同步更新。
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
 
 jobs:
   # ==========================================================================
@@ -138,6 +149,9 @@ jobs:
     # 需要时在 Run workflow 里勾 build_android。
     if: ${{ inputs.build_android }}
     runs-on: ubuntu-22.04
+    env:
+      # 值来自 Repository Variables（见文件头说明），不在这里明文写
+      RENDEZVOUS_SERVER: ${{ vars.RENDEZVOUS_SERVER }}
     steps:
       - name: Install dependencies
         run: |
@@ -260,7 +274,31 @@ jobs:
     env:
       # hwcodec/build.rs 与 build.py 都靠这个变量找 ffmpeg / libvpx
       VCPKG_ROOT: C:\vcpkg
+      # 以下五个来自 Repository Variables（原先明文写在本文件里，而本仓库是 public）
+      RENDEZVOUS_SERVER: ${{ vars.RENDEZVOUS_SERVER }}
+      RELAY_SERVER:      ${{ vars.RELAY_SERVER }}
+      API_SERVER:        ${{ vars.API_SERVER }}
+      RS_PUB_KEY:        ${{ vars.RS_PUB_KEY }}
+      APP_NAME:          ${{ vars.APP_NAME }}
     steps:
+      # 变量缺失或名字写错时，${{ vars.X }} 会静默展开成空串，一路撑到最后的校验
+      # 步骤才炸 —— 那时一小时已经白等了。先在这里死掉，并点名是哪一个。
+      - name: Preflight - 自建服务器参数不得为空
+        shell: pwsh
+        run: |
+          $need = [ordered]@{
+            RENDEZVOUS_SERVER = $env:RENDEZVOUS_SERVER
+            RELAY_SERVER      = $env:RELAY_SERVER
+            API_SERVER        = $env:API_SERVER
+            RS_PUB_KEY        = $env:RS_PUB_KEY
+            APP_NAME          = $env:APP_NAME
+          }
+          $bad = @($need.Keys | Where-Object { [string]::IsNullOrWhiteSpace($need[$_]) })
+          if ($bad.Count -gt 0) {
+            throw "以下 Repository Variables 未设置或为空：$($bad -join ', ')"
+          }
+          Write-Host "[OK] 五个自建服务器参数均已从 Variables 读到（值不打印，避免进公开日志）"
+
       - name: Checkout RustDesk
         shell: pwsh
         run: |
@@ -576,13 +614,16 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 走 env 传入，不再把值写进脚本；Release 页面是公开的，
+          # 说明文字里也不该出现自建服务器地址。
+          APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -eu
           ls -lh dist
           tag="windows-$(date -u +%Y%m%d-%H%M%S)"
           gh release create "$tag" dist/* \
             --repo "${{ github.repository }}" \
-            --title "RustDesk-CCD Windows 安装包 $tag" \
-            --notes "RustDesk-CCD Windows x64。内置会合/中继 ccdlsx.i234.me，AppName=RustDesk-CCD，公钥已注入。未做代码签名：首次运行会有 SmartScreen「未知发布者」提示。" \
+            --title "$APP_NAME Windows 安装包 $tag" \
+            --notes "$APP_NAME Windows x64（安装包 + 便携版）。内置自建会合/中继服务器。未做代码签名：首次运行会有 SmartScreen「未知发布者」提示。" \
             --latest
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/$tag"
